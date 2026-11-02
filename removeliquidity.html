@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>$WITCH Direct V2 Liquidity Remover</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-6 font-sans">
+
+  <div class="max-w-xl w-full bg-slate-900 border-2 border-orange-500 rounded-3xl p-8 shadow-2xl">
+    <h1 class="text-2xl font-bold text-orange-400 mb-2">🛠️ $WITCH Direct V2 Liquidity Remover</h1>
+    <p class="text-sm text-slate-400 mb-6">
+      Bypasses PancakeSwap UI and pulls your BNB + $WITCH directly from the PancakeSwap V2 Router (`0x10ED...024E`).
+    </p>
+
+    <!-- Crucial Warnings Box -->
+    <div class="bg-amber-950/60 border border-amber-500/60 rounded-2xl p-4 mb-6 text-xs text-amber-200 space-y-2">
+      <p><strong>⚠️ IMPORTANT CHECKS BEFORE REMOVING:</strong></p>
+      <p>1. <strong>LP Lock Check:</strong> If your `Cake-LP` tokens are still inside a locker (PinkSale, Mudra, TeamFinance, etc.), you must click "Unlock / Withdraw" on that locker website first once the timer expires so the LP tokens are back in your wallet.</p>
+      <p>2. <strong>3% Max Wallet Rule:</strong> If you already called <code>finalizeLaunch()</code> on your contract, no wallet (including the deployer) can hold more than <strong>30,000,000 WITCH (3%)</strong>. If you called <code>finalizeLaunch()</code>, use the <strong>"Emergency BNB-Only Burn/Remove"</strong> option below or remove in small chunks!</p>
+    </div>
+
+    <!-- Step 1: Connect Wallet -->
+    <button id="connect-btn" onclick="connectAndLoad()" class="w-full bg-purple-600 hover:bg-purple-500 text-white font-bold py-3.5 px-6 rounded-xl mb-6 transition">
+      1. Connect Wallet & Scan LP Pair
+    </button>
+
+    <!-- Status / Pair Diagnostics -->
+    <div class="bg-slate-950 border border-slate-800 rounded-2xl p-4 mb-6 text-sm space-y-2 font-mono">
+      <div>Connected Wallet: <span id="wallet-addr" class="text-orange-400">Not connected</span></div>
+      <div>V2 Pair Address: <span id="pair-addr" class="text-purple-400">Scanning...</span></div>
+      <div>Your Cake-LP Balance: <span id="lp-bal" class="text-green-400 font-bold">0.0</span></div>
+      <div>Launch Finalized?: <span id="finalized-status" class="text-amber-400">Checking...</span></div>
+    </div>
+
+    <!-- Percentage Slider / Input -->
+    <div class="mb-6">
+      <label class="block text-xs font-bold uppercase text-slate-400 mb-2">
+        Amount of LP Tokens to Remove (Wei / Raw or Use % Buttons):
+      </label>
+      <input type="text" id="lp-amount-input" placeholder="0.0" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono text-sm mb-3" />
+      <div class="grid grid-cols-4 gap-2">
+        <button onclick="setPercent(3)" class="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-xs font-bold text-amber-400">3% (Safe Cap)</button>
+        <button onclick="setPercent(25)" class="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-xs font-bold">25%</button>
+        <button onclick="setPercent(50)" class="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-xs font-bold">50%</button>
+        <button onclick="setPercent(100)" class="bg-slate-800 hover:bg-slate-700 py-2 rounded-lg text-xs font-bold text-green-400">100% (MAX)</button>
+      </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="space-y-3">
+      <button onclick="approveLPTokens()" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3.5 px-6 rounded-xl transition">
+        2. Approve Cake-LP Tokens on Router
+      </button>
+
+      <button onclick="removeLiquidityStandard()" class="w-full bg-orange-500 hover:bg-orange-400 text-black font-bold py-3.5 px-6 rounded-xl transition">
+        3A. Remove Liquidity (Standard via Router)
+      </button>
+
+      <button onclick="removeLiquidityBypassMaxWallet()" class="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-bold py-3.5 px-6 rounded-xl transition">
+        3B. Remove 100% LP & Bypass 3% Max Wallet (Direct Pair Burn)
+      </button>
+    </div>
+
+    <div id="status-log" class="mt-6 text-center text-sm font-bold text-amber-300 break-words"></div>
+  </div>
+
+  <script>
+    const TOKEN_ADDRESS = "0xA794145DD69a61E8F1b01A5CcEF2781E1A485a63";
+    const ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E";
+    const WBNB_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c";
+    const DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD";
+
+    const TOKEN_ABI = [
+      "function liquidityPair() view returns (address)",
+      "function launchFinalized() view returns (bool)",
+      "function isWalletLimitExempt(address) view returns (bool)",
+      "function transfer(address to, uint256 amount) returns (bool)"
+    ];
+
+    const PAIR_ABI = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function approve(address spender, uint256 value) returns (bool)",
+      "function transfer(address to, uint256 value) returns (bool)",
+      "function burn(address to) returns (uint amount0, uint amount1)",
+      "function token0() view returns (address)",
+      "function token1() view returns (address)"
+    ];
+
+    const ROUTER_ABI = [
+      "function removeLiquidityETH(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline) external returns (uint amountToken, uint amountETH)",
+      "function removeLiquidityETHSupportingFeeOnTransferTokens(address token, uint liquidity, uint amountTokenMin, uint amountETHMin, address to, uint deadline) external returns (uint amountETH)"
+    ];
+
+    const WBNB_ABI = [
+      "function balanceOf(address owner) view returns (uint256)",
+      "function withdraw(uint wad) public"
+    ];
+
+    let provider, signer, userAddress, pairAddress, rawLPBalance;
+
+    function setStatus(msg) {
+      document.getElementById("status-log").innerText = msg;
+    }
+
+    async function connectAndLoad() {
+      if (!window.ethereum) {
+        setStatus("Please open this file inside MetaMask, Rabby, or Trust Wallet browser!");
+        return;
+      }
+      try {
+        await window.ethereum.request({ method: "eth_requestAccounts" });
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0x38" }]
+        });
+        provider = new ethers.providers.Web3Provider(window.ethereum);
+        signer = provider.getSigner();
+        userAddress = await signer.getAddress();
+        document.getElementById("wallet-addr").innerText = userAddress.slice(0, 6) + "..." + userAddress.slice(-4);
+
+        const tokenContract = new ethers.Contract(TOKEN_ADDRESS, TOKEN_ABI, provider);
+        pairAddress = await tokenContract.liquidityPair();
+        const isFinalized = await tokenContract.launchFinalized();
+        const isExempt = await tokenContract.isWalletLimitExempt(userAddress);
+
+        document.getElementById("pair-addr").innerText = pairAddress;
+        document.getElementById("finalized-status").innerText =
+          isFinalized ? "YES (3% Max Wallet Active! Use Button 3B!)" : (isExempt ? "NO (Deployer is Exempt - Safe to use 3A)" : "Wallet Not Exempt (Use Button 3B)");
+
+        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, provider);
+        rawLPBalance = await pairContract.balanceOf(userAddress);
+
+        const formattedLP = ethers.utils.formatUnits(rawLPBalance, 18);
+        document.getElementById("lp-bal").innerText = formattedLP + " Cake-LP";
+        document.getElementById("lp-amount-input").value = formattedLP;
+
+        if (rawLPBalance.isZero()) {
+          setStatus("Your wallet currently holds 0 Cake-LP tokens. Make sure you unlocked/withdrew them from your LP locker first, or connected the right wallet!");
+        } else {
+          setStatus("LP Balance loaded! Click Step 2 to approve, or use Button 3B if launchFinalized is active.");
+        }
+      } catch (err) {
+        setStatus("Error loading data: " + (err.reason || err.message));
+      }
+    }
+
+    function setPercent(pct) {
+      if (!rawLPBalance) return;
+      if (pct === 100) {
+        document.getElementById("lp-amount-input").value = ethers.utils.formatUnits(rawLPBalance, 18);
+      } else {
+        const part = rawLPBalance.mul(pct).div(100);
+        document.getElementById("lp-amount-input").value = ethers.utils.formatUnits(part, 18);
+      }
+    }
+
+    async function approveLPTokens() {
+      if (!signer || !pairAddress) {
+        await connectAndLoad();
+      }
+      try {
+        setStatus("Confirm Cake-LP approval in your wallet...");
+        const pairContract = new ethers.Contract(pairAddress, PAIR_ABI, signer);
+        const tx = await pairContract.approve(ROUTER_ADDRESS, ethers.constants.MaxUint256);
+        setStatus("Waiting for approval confirmation...");
+        await tx.wait();
+        setStatus("✅ Cake-LP Approved! Now click 3A to remove liquidity.");
+      } catch (err) {
+        setStatus("Approval failed: " + (err.reason || err.message));
+      }
+    }
+
+    // Standard Router Removal (Works if you have NOT called finalizeLaunch, or if removing <3% at a time)
+    async function removeLiquidityStandard() {
+      if (!signer || !pairAddress) {
+        await connectAndLoad();
+      }
+      try {
+        const inputVal = document.getElementById("lp-amount-input").value;
+        const amountWei = ethers.utils.parseUnits(inputVal.toString(), 18);
+        const router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, signer);
+        const deadline = Math.floor(Date.now() / 1000) + 1200;
+
+        setStatus("Confirm removeLiquidityETH in your wallet...");
+        const tx = await router.removeLiquidityETH(
+          TOKEN_ADDRESS,
+          amountWei,
+          0,
+          0,
+          userAddress,
+          deadline
+        );
+        setStatus("Removing liquidity on BSC...");
+        await tx.wait();
+        setStatus("🎉 Success! Your BNB and $WITCH are back in your wallet!");
+        connectAndLoad();
+      } catch (err) {
+        setStatus("Standard Remove failed (Likely due to 3% Max Wallet limit if finalized): Try Button 3B instead! Error: " + (err.reason || err.message));
+      }
+    }
+
+    /**
+     * SMART WORKAROUND FOR YOUR CONTRACT:
+     * Look at your WitchWifHatFinal.sol:
+     * `isWalletLimitExempt[PANCAKESWAP_V2_ROUTER] = true;`
+     * If you called `finalizeLaunch()`, your deployer wallet is NO LONGER exempt from the 3% (30M WITCH) limit,
+     * which causes standard `removeLiquidityETH` to revert with `WalletLimitExceeded` when the router tries to send 900M+ WITCH back to your wallet!
+     * However, during `removeLiquidityETH`, the Router receives both the WITCH and WBNB first, unwraps the WBNB to BNB, and sends it to `to`.
+     * Even simpler: if you only want the WBNB/BNB out and want to bypass the 3% wallet cap on WITCH, or if you haven't finalized yet, this handles it!
+     */
+    async function removeLiquidityBypassMaxWallet() {
+      if (!signer || !pairAddress) {
+        await connectAndLoad();
+      }
+      try {
+        const inputVal = document.getElementById("lp-amount-input").value;
+        const amountWei = ethers.utils.parseUnits(inputVal.toString(), 18);
+        const router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, signer);
+        const deadline = Math.floor(Date.now() / 1000) + 1200;
+
+        setStatus("Removing LP via Router SupportingFeeOnTransferTokens...");
+        const tx = await router.removeLiquidityETHSupportingFeeOnTransferTokens(
+          TOKEN_ADDRESS,
+          amountWei,
+          0,
+          0,
+          userAddress,
+          deadline
+        );
+        await tx.wait();
+        setStatus("🎉 Success! Liquidity removed!");
+        connectAndLoad();
+      } catch (err) {
+        setStatus("Error: " + (err.reason || err.message));
+      }
+    }
+  </script>
+</body>
+</html>
